@@ -5,7 +5,7 @@ from django.conf import settings
 from django.core.files.storage import FileSystemStorage
 import cv2
 import numpy as np
-import os
+import os 
 
 
 def index(request):

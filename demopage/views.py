@@ -1,18 +1,44 @@
 from django.shortcuts import render, redirect
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.contrib.auth import authenticate, login as auth_login
-from django.conf import settings
+from django.contrib.auth import logout as auth_logout
+from django.contrib.auth.decorators import login_required
 from django.core.files.storage import FileSystemStorage
 import cv2
-import numpy as np
-import os 
+import os
+import torch
+from torchvision import transforms
+from timm import create_model
+
+# Define the path to the model
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # Base directory of your Django project
+MODEL_PATH = os.path.join(BASE_DIR, 'vit_model.pth')  # Adjust 'vit_model.pth' to the actual path
+
+# Check if the model file exists
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"The model file was not found at {MODEL_PATH}")
+
+model = create_model('vit_base_patch16_224', pretrained=False, num_classes=8)  # Replace with your ViT model
+model.load_state_dict(torch.load(MODEL_PATH))  # Load your trained model's state dict
+model.eval()  # Set the model to evaluation mode
+
+# Image preprocessing
+preprocess = transforms.Compose([
+    transforms.ToPILImage(),  # Convert the image to PIL format
+    transforms.Resize((224, 224)),  # Resize to the input size of the model (adjust based on your ViT model)
+    transforms.ToTensor(),  # Convert to tensor
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize like ImageNet
+])
 
 
-def index(request):
-    return render(request, 'index.html')
+def home(request):
+    return render(request, 'home.html')
 
 
 def login(request):
+    if request.user.is_authenticated:
+        return redirect('/profile')  # Redirect to profile if already logged in
+
     if request.method == "POST":
         un = request.POST['username']
         pw = request.POST['password']
@@ -28,95 +54,119 @@ def login(request):
         form = AuthenticationForm()
         return render(request, 'login.html', {'form': form})
 
+class CustomUserCreationForm(UserCreationForm):
+    class Meta:
+        model = UserCreationForm.Meta.model
+        fields = UserCreationForm.Meta.fields
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['username'].widget.attrs.pop('required', None)  # Remove required attribute
+        self.fields['username'].widget.attrs.update({'class': 'form-control'})
 
 def signup(request):
+    if request.user.is_authenticated:
+        return redirect('/profile')  # Redirect to profile if already logged in
+
     if request.method == "POST":
-        form = UserCreationForm(request.POST)
+        form = CustomUserCreationForm(request.POST)
         if form.is_valid():
             form.save()
             return redirect('/login')  # Redirect to the login page after successful signup
     else:
-        form = UserCreationForm()
+        form = CustomUserCreationForm()
 
     return render(request, 'signup.html', {'form': form})
 
-
+@login_required()
 def profile(request):
-    if request.method == 'POST' and request.FILES.get('uploaded_image'):
-        uploaded_image = request.FILES['uploaded_image']
+    img_url = None
+    result1 = None
+    result2 = None
 
-        # Validate the uploaded file type
-        if not uploaded_image.content_type.startswith('image/'):
-            return render(request, 'profile.html', {'error_message': 'Invalid file type. Please upload an image.'})
+    if(request.method=="POST"):
+        if(request.FILES.get('uploadImage')):
+            img_name = request.FILES['uploadImage']
+            # create a variable for our FileSystem package
+            fs = FileSystemStorage()
+            filename = fs.save(img_name.name,img_name)
+            #urls
+            img_url = fs.url(filename)
+            #find the path of the image
+            img_path = fs.path(filename)
 
-        fs = FileSystemStorage()
-        filename = fs.save(uploaded_image.name, uploaded_image)
-        uploaded_image_url = fs.url(filename)
+            # Image loading and preprocessing
+            img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
 
-        # Path to the uploaded image
-        image_path = os.path.join(settings.MEDIA_ROOT, filename)
-        img = cv2.imread(image_path)
+            # Apply the preprocessing pipeline
+            input_tensor = preprocess(img)
+            input_batch = input_tensor.unsqueeze(0)  # Add batch dimension
 
-        if img is None:
-            return render(request, 'profile.html', {'error_message': 'Could not read the uploaded image file.'})
+            # Perform the prediction
+            with torch.no_grad():
+                output = model(input_batch)
 
-        try:
-            # Resize the original uploaded image to a consistent size (183x275)
-            img_resized_uploaded = cv2.resize(img, (275,183))
+            # Assuming the model's output is a class index
+            _, predicted_class = torch.max(output, 1)
 
-            # Save the resized uploaded image for display
-            resized_filename = f'resized_{filename}'
-            resized_path = os.path.join(settings.MEDIA_ROOT, resized_filename)
-            cv2.imwrite(resized_path, img_resized_uploaded)
-            resized_image_url = fs.url(resized_filename)
+            ''''''
+            skin_disease_names = ['Cellulitis','Impetigo','Athlete Foot','Nail Fungus',
+                                  'Ringworm','Cutaneous Larva Migrans','Chickenpox','Shingles']
 
-            # Process the resized image for defect detection
-            # Convert to grayscale and apply Gaussian blur for noise reduction
-            gray = cv2.cvtColor(img_resized_uploaded, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            diagnosis = ['''Common and potentially serious bacterial skin and subcutaneous (i.e., under the  skin) tissue infections. 
+                        With cellulitis, bacteria enter the skin.
+                        Cellulitis may spread rapidly. Affected skin appears swollen and red and may be hot and tender.
+                        Without treatment with an antibiotic, cellulitis can be life-threatening.''',
 
-            # Use adaptive thresholding to better handle varying lighting conditions
-            thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+                        '''A highly contagious skin infection that causes red sores on the face.
+                        Impetigo mainly affects infants and children. They are caused by group gram-positive staphylococcus aureus and group A beta-hemolytic streptococcus.
+                        The main symptom is red sores that form around the nose and mouth. The sores rupture, ooze for a few days, then form a yellow-brown crust.
+                        Antibiotics shorten the infection and can help prevent spread to others.''',
 
-            # Apply dilation to close gaps between nearby contours and erosion to remove noise
-            kernel = np.ones((3, 3), np.uint8)
-            dilated = cv2.dilate(thresh, kernel, iterations=1)
-            eroded = cv2.erode(dilated, kernel, iterations=1)
+                        '''A fungal infection that usually begins between the toes.
+                        Athlete's foot commonly occurs in people whose feet have become very sweaty while confined within tight-fitting shoes.
+                        Symptoms include a scaly rash that usually causes itching, stinging and burning. People with athlete's foot can have moist, raw skin between their toes.
+                        Treatment involves topical antifungal medication.''',
 
-            # Find contours of defects
-            contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            result_img = img_resized_uploaded.copy()
+                        '''A nail fungus causing thickened, brittle, crumbly or ragged nails.
+                        Usually, the problems caused by this condition are cosmetic.
+                        The main symptoms are changes in the appearance of nails. Rarely, the condition causes pain or a slightly foul odor.
+                        Treatments include oral antifungal drugs, medicated nail polish or cream or nail removal.''',
 
-            detected_areas = []
-            for contour in contours:
-                x, y, w, h = cv2.boundingRect(contour)
+                        '''A highly contagious fungal infection of the skin or scalp.
+                        Ringworm is spread by skin-to-skin contact or by touching an infected animal or object.
+                        Ringworm is typically scaly and may be red and itchy. Ringworm of the scalp is common in children, where it may cause bald patches.
+                        The treatment for ringworm is antifungal medication.''',
 
-                # No filtering on contour size, to ensure even small defects are detected
-                if w > 5 and h > 5:  # Lower the size threshold to catch smaller defects
-                    detected_areas.append((x, y, w, h))
-                    cv2.rectangle(result_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.putText(result_img, f"W:{w}, H:{h}", (x, y - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                        '''Cutaneous larva migrans (abbreviated CLM), colloquially called creeping eruption, is a skin disease in humans, caused by the larvae of various nematode parasites of the hookworm family (Ancylostomatidae).
+                        The parasites live in the intestines of dogs, cats, and wild animals.
+                        The infection causes a red, intensely itchy eruption and may look like twirling lesions.
+                        The itching can become very painful and if scratched may allow a secondary bacterial infection to develop.
+                        Cutaneous larva migrans usually heals spontaneously over weeks to months and has been known to last as long as one year.
+                        However the severity of the symptoms usually causes those infected to seek medical treatment before spontaneous resolution occurs.
+                        After proper treatment, migration of the larvae within the skin is halted and relief of the associated itching can occur in less than 48 hours.
+                        Albendazole is a very effective treatment for CLM.''',
 
-            # Resize the processed image to the same size as the original uploaded image
-            img_resized_processed = cv2.resize(result_img, (275,183))
+                        '''A highly contagious viral infection which causes an itchy, blister-like rash on the skin.
+                        Chickenpox is highly contagious to those who haven't had the disease or been vaccinated against it.
+                        The most characteristic symptom is an itchy, blister-like rash on the skin.
+                        Chickenpox can be prevented by a vaccine. Treatment usually involves relieving symptoms, although high-risk groups may receive antiviral medication.
+                        ''',
 
-            # Save the processed image
-            processed_filename = f'processed_{filename}'
-            processed_path = os.path.join(settings.MEDIA_ROOT, processed_filename)
-            cv2.imwrite(processed_path, img_resized_processed)
-            processed_image_url = fs.url(processed_filename)
+                        '''Shingles are a viral infection that usually occurs in adults and causes a painful rash.
+                        Anyone who has had chickenpox may develop shingles. It is not known what causes the virus to reactivate. Shingles may occur anywhere in your body.
+                        Shingles cause a painful rash that may appear as a stripe of blisters on the dermatomal distribution. Pain can persist even after the rash is gone (this is called post-herpetic neuralgia).
+                        Treatments include pain relief (nonsteroidal anti-inflammatory drugs [NSAIDs] and antiviral medications such as Acyclovir, Valacyclovir, Famciclovir, and numbing medications such as Lidocaine).
+                        A chickenpox vaccine in childhood or a shingles vaccine in adulthood can minimize the risk of developing complications.'''
+                        ]
 
-            # Prepare output data with detected areas (defects)
-            areas_info = [f"Width={w}px, Height={h}px" for (x, y, w, h) in detected_areas]
+            result1 = skin_disease_names[predicted_class.item()]
+            result2 = diagnosis[predicted_class.item()]
 
-            return render(request, 'profile.html', {
-                'uploaded_image_url': resized_image_url,  # Display resized image
-                'processed_image_url': processed_image_url,  # Display processed image
-                'areas_info': areas_info
-            })
+    return render(request,'profile.html',{'img':img_url,'obj1':result1,'obj2':result2})
 
-        except Exception as e:
-            return render(request, 'profile.html', {'error_message': f"Error processing the image: {e}"})
 
-    return render(request, 'profile.html')
+def logout(request):
+    auth_logout(request)
+    return redirect('/login') 
